@@ -3,55 +3,82 @@ import re
 import random
 import spacy 
 import string
+from io import BytesIO
+import time
+import PyPDF2
+from PyPDF2 import PdfReader
+import docx
 from nltk.corpus import wordnet as wn
 from collections import Counter
-nltk.download('wordnet')
+from docx import Document
+
+try:
+    wn.ensure_loaded() 
+except LookupError:
+    print('downloading wordnet...')
+    nltk.download('wordnet', quiet=True) 
 
 nlp = spacy.load('en_core_web_lg')
-NER_CACHE = {}
 
-def get_ner_list(text):
-    if text not in NER_CACHE:
-        doc = nlp(text)
-        NER_CACHE[text] = {}
-        for ent in doc.ents:
-            NER_CACHE[text].setdefault(ent.label_, []).append(ent.text)
-    return NER_CACHE[text]
+def extract_text(uploaded_file):
+    if uploaded_file.type == "text/plain":
+        return uploaded_file.getvalue().decode("utf-8")
+    elif uploaded_file.type == "application/pdf":
+        pdf_reader = PyPDF2.PdfReader(uploaded_file)
+        return " ".join([page.extract_text() for page in pdf_reader.pages])
+    elif "wordprocessingml" in uploaded_file.type:  # DOCX
+        doc = Document(uploaded_file)
+        return "\n".join([para.text for para in doc.paragraphs])
+    return "Unsupported file type"
+
+def read_text_from_file(file_path):
+    if file_path.endswith(".txt"):
+        with open(file_path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    elif file_path.endswith(".pdf"):
+        reader = PdfReader(file_path)
+        return "".join([page.extract_text() for page in reader.pages if page.extract_text()])
+
+    elif file_path.endswith(".docx"):
+        doc = docx.Document(file_path)
+        return "\n".join([para.text for para in doc.paragraphs])
+    else:
+        raise ValueError("Unsupported file type")
 
 def extract_keywords(sent):
     doc = nlp(sent)
-    ner_nouns = [ent.text for ent in doc.ents if ent.label_ and nlp(ent.text)[0].pos_ == "NOUN"]
-    if ner_nouns:
-        return ner_nouns[0]
-    nouns = [token.text for token in doc if token.pos_ == "NOUN"]
-    noun_freq = Counter(nouns)
-    for noun, _ in noun_freq.most_common():
-        if wn.synsets(noun, pos='n'):
-            return noun
+    
+    filtered_tokens = [
+        token for token in doc 
+        if not token.is_stop and not token.is_punct
+    ]
 
-    return None  # If no valid noun with synset is found
+    keywords = []
+    for token in filtered_tokens:
+        if token.pos_ == "NOUN":
+            if wn.synsets(token.text, pos='n'):  
+                return token.text
+        elif token.pos_ in ("VERB", "ADJ") and wn.synsets(token.text):
+            keywords.append(token.text)  
+    return keywords[0] if keywords else None
 
-def extract_distractors(word,text):
+def extract_distractors(word):
     doc = nlp(word)
     lemma = doc[0].lemma_.lower()
     distractors = []
-    if NER_CACHE:
-        for key, values in NER_CACHE.items():
-            if lemma in [nlp(v)[0].lemma_.lower() for v in values]:
-                related_distractors = [v for v in values if nlp(v)[0].lemma_.lower() != lemma]
-                if len(related_distractors) < 3:
-                    synsets = wn.synsets(lemma, pos='n')
-                    if synsets:
-                        wn_distractors = get_distractors_wordnet(synsets[0], lemma)
-                        distractors = related_distractors + wn_distractors
-                        return distractors[:3]
-                return related_distractors[:3]
 
     synsets = wn.synsets(lemma, pos='n')
-    if synsets:
-        distractors = get_distractors_wordnet(synsets[0], lemma)
+    for syn in synsets:
+        distractors += get_distractors_wordnet(syn, lemma)
+        distractors = list(set(distractors))  # Remove duplicates
+        distractors = [d for d in distractors if d.lower() != lemma.lower()]
+        if len(distractors) >= 2:
+            break  
+    while len(distractors) < 2:
+        distractors.append(f"dummy{len(distractors)+1}") 
 
-    return distractors[:3] if distractors else []
+    return distractors[:3]  # Return max 3
 
 def get_distractors_wordnet(syn, word):
     distractors = []
@@ -64,7 +91,7 @@ def get_distractors_wordnet(syn, word):
         name = item.lemmas()[0].name()
         if name == orig_word:
             continue
-        name = " ".join(w.capitalize() for w in name.replace("_", " ").split())
+        name = " ".join(w.capitalize() for w in name.replace("_", " ").split()).lower()
         if name and name not in distractors:
             distractors.append(name)
     return distractors
@@ -91,33 +118,43 @@ def format_mcqs(questions):
 
     return formatted
 
-def text_to_questions_pipeline(text_file,max_choice=5):
-    with open(text_file, encoding="utf-8") as f:
-        text = f.read()
-    
+def text_to_questions_pipeline(text, max_choice=5):
+
     text = text.replace("\n", " ").strip()
     text = re.sub(r'\s+', ' ', text)
     doc = nlp(text)
-    sentences = [sent.text for sent in doc.sents if sum(1 for token in sent if token.pos_ == 'NOUN') >= 2]
-    chosen_sents = random.sample(sentences, max_choice)
+    sentences = [sent.text for sent in doc.sents if sum(1 for token in sent if token.pos_ == 'NOUN' and not token.is_stop and not token.is_punct) >= 2]
+    chosen_sents = random.sample(sentences, min(max_choice, len(sentences)))
     questions = {}
     for i, sent in enumerate(chosen_sents):
         keyword = extract_keywords(sent)
         if keyword:
-            distractors = extract_distractors(keyword,text)
+            distractors = extract_distractors(keyword)
+
             question_sent = sent.replace(keyword, "_______")
-            questions[i+1] = {
+            options = distractors[:3]
+            random.shuffle(options)
+            questions[i] = {
                 'question': question_sent,
-                'answer': keyword,
-                'options': [keyword] + distractors[:3] 
+                'answer': keyword.lower(),
+                'options': options
             }
     return format_mcqs(questions)
 
+
 if __name__ == "__main__":
-    questions = text_to_questions_pipeline("input/universe.txt",max_choice=10)
+    start_time = time.time()
+    file_path = "input/Lect_01.pdf"
+    file_content = read_text_from_file(file_path)
+    questions = text_to_questions_pipeline(file_content, max_choice=10)
+
+    end_time = time.time()
+    elapsed_time = end_time - start_time
 
     for q_id, q in questions.items():
         print(f"Q{q_id}: {q['question']}")
         for opt, val in q['options'].items():
             print(f"  {opt}) {val}")
         print(f"Answer: {q['answer']}\n")
+
+    print(f"Time taken: {elapsed_time:.2f} seconds")
